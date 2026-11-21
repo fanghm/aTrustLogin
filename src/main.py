@@ -4,6 +4,7 @@ import platform
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -40,8 +41,12 @@ class ATrustLoginStorage(BaseModel):
     local_storage: Dict[str, Any]
 
 
+class ManualAuthRequired(TimeoutException):
+    """Waited long enough for a human and gave up; the browser page is left untouched."""
+
+
 class ATrustLogin:
-    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, login_timeout=300, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5):
+    def __init__(self, portal_address, driver_path=None, browser_path=None, driver_type=None, data_dir="data", cookie_tid=None, cookie_sig=None, interactive=False, container_mode=False, login_timeout=300, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5, beep=True, beep_tty=None, manual_beep_interval=60):
         self.initialized = False
         self.container_mode = container_mode
         self.driver = None
@@ -53,17 +58,23 @@ class ATrustLogin:
         self.portal_origin(portal_address)
         if login_timeout <= 0:
             raise ValueError("login_timeout must be greater than zero")
+        if manual_beep_interval <= 0:
+            raise ValueError("manual_beep_interval must be greater than zero")
         validate_browser_resources(disk_cache_size_mib, browser_log_size_mib, browser_log_files)
         self.disk_cache_size_mib = disk_cache_size_mib
         self.browser_log_size_mib = browser_log_size_mib
         self.browser_log_files = browser_log_files
         self.login_timeout = login_timeout
+        self.beep = beep
+        self.beep_tty = beep_tty
+        self.manual_beep_interval = manual_beep_interval
         os.makedirs(data_dir, exist_ok=True)
         self.data_dir = data_dir
         self.interactive = interactive
         self.cookie_tid = cookie_tid
         self.cookie_sig = cookie_sig
         self.must_be_logged_keywords = ['app_center', 'user_info', 'app_apply', 'device_manage']
+        self._manual_auth_at = None
 
         try:
             self._start_browser(driver_path, browser_path, driver_type)
@@ -185,6 +196,34 @@ class ATrustLogin:
         for name, value in (("language", "zh-CN"), ("lang", "zh-cn")):
             self.driver.delete_cookie(name)
             self.driver.add_cookie({"name": name, "value": value, "path": "/"})
+
+    def keepalive_refresh(self):
+        """Ping the portal in the tab we already have, never in a new one.
+
+        A full navigation followed by ``switch_to`` on the newest handle is what
+        made every keepalive tick look like a fresh login window. Refreshing the
+        current tab keeps one window alive for the whole session.
+        """
+        if not self.is_portal_page():
+            return False
+        before = self.driver.window_handles
+        self.driver.refresh()
+        after = self.driver.window_handles
+        if after != before:
+            # The portal opened a window behind our back; come back to ours.
+            logger.debug("Portal opened {} extra window(s); returning to the session tab", len(after) - len(before))
+            self.focus_session_window(before)
+        return True
+
+    def focus_session_window(self, handles):
+        """Switch back to the first handle we tracked, closing nothing."""
+        for handle in handles:
+            try:
+                self.driver.switch_to.window(handle)
+                return True
+            except WebDriverException:
+                continue
+        return False
 
     def wait_login_page(self):
         self.wait.until(lambda d: self.is_portal_page())
@@ -312,16 +351,78 @@ class ATrustLogin:
                     "name": name, "value": value, "domain": self.portal_host, "path": "/",
                 })
 
+    def ring_attention(self):
+        """Ask a human to come back to the browser: terminal BEL, repeated on demand.
+
+        Deliberately quiet about it in the log: the log is for diagnostics, the
+        beep is for the human standing next to the machine.
+        """
+        if not self.beep:
+            return False
+        try:
+            if self.beep_tty is not None:
+                stream = open(self.beep_tty, "w", encoding="ascii", errors="ignore")
+            else:
+                stream = open("/dev/tty", "w", encoding="ascii", errors="ignore")
+        except OSError:
+            # No controlling terminal (systemd, docker -d): fall back to stderr.
+            if self.beep_tty is None:
+                sys.stderr.write("\a")
+                sys.stderr.flush()
+                return True
+            logger.debug("Cannot open beep target {}; skipping audible alert", self.beep_tty)
+            return False
+        try:
+            stream.write("\a")
+            stream.flush()
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
     def wait_for_manual_login(self):
+        """Wait for a human, without reloading the page they are working on.
+
+        The page is left in whatever state the human reached. When the wait runs
+        out we raise instead of refreshing, so a forgotten login never turns into
+        an endless browser-refresh loop; the caller decides how to retry.
+        """
         logger.info("Complete login in the browser or VNC; waiting up to {} seconds", self.login_timeout)
-        WebDriverWait(self.driver, self.login_timeout).until(lambda d: self.is_logged())
+        logger.info("No page refresh happens while waiting; the portal is left as is")
+        self.warn_manual_auth()
+        try:
+            WebDriverWait(self.driver, self.login_timeout).until(lambda d: self.is_logged())
+        except TimeoutException as exc:
+            logger.warning(
+                "Manual authentication still pending after {} seconds; leaving the browser page untouched",
+                self.login_timeout,
+            )
+            raise ManualAuthRequired(
+                f"manual authentication not completed within {self.login_timeout} seconds"
+            ) from exc
         self.update_storage()
         return True
+
+    def warn_manual_auth(self):
+        """Beep and log when a human is needed, throttled so retries stay quiet."""
+        now = time.monotonic()
+        last = getattr(self, "_manual_auth_at", None)
+        if last is not None and now - last < self.manual_beep_interval:
+            logger.debug("Manual authentication still pending; alert throttled")
+            return
+        self._manual_auth_at = now
+        logger.warning("Manual authentication required: switch to the browser window and finish it")
+        self.ring_attention()
 
     def require_interact(self, condition=None):
         if not self.interactive:
             raise RuntimeError("Browser interaction required; use --interactive=True")
         logger.info("Complete verification in the browser or VNC")
+        self.warn_manual_auth()
         WebDriverWait(self.driver, self.login_timeout).until(condition or (lambda d: self.is_logged()))
 
     def init(self):
@@ -464,11 +565,13 @@ class ATrustLogin:
                 time.sleep(min(5, max(0, deadline - time.monotonic())))
 
 
-def main(portal_address, username=None, password=None, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, login_timeout=300, client_timeout=120, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5):
+def main(portal_address, username=None, password=None, totp_key=None, cookie_tid=None, cookie_sig=None, keepalive=200, data_dir="./data", driver_type=None, driver_path=None, browser_path=None, interactive=False, wait_atrust=True, container_mode=False, login_timeout=300, client_timeout=120, disk_cache_size_mib=256, browser_log_size_mib=20, browser_log_files=5, beep=True, beep_tty=None, manual_beep_interval=60):
     if (username is None) != (password is None):
         raise ValueError("Provide both username and password, or omit both for browser login")
     if login_timeout <= 0 or client_timeout <= 0:
         raise ValueError("login_timeout and client_timeout must be greater than zero")
+    if manual_beep_interval <= 0:
+        raise ValueError("manual_beep_interval must be greater than zero")
     validate_browser_resources(disk_cache_size_mib, browser_log_size_mib, browser_log_files)
     ATrustLogin.portal_origin(portal_address)
     if wait_atrust:
@@ -480,24 +583,52 @@ def main(portal_address, username=None, password=None, totp_key=None, cookie_tid
         container_mode=container_mode, login_timeout=login_timeout,
         disk_cache_size_mib=disk_cache_size_mib,
         browser_log_size_mib=browser_log_size_mib, browser_log_files=browser_log_files,
+        beep=beep, beep_tty=beep_tty, manual_beep_interval=manual_beep_interval,
     )
+    pending_manual = False
     try:
         while True:
             try:
                 if not at.initialized or not at.is_logged():
-                    if at.initialized:
-                        at.open_portal()
-                        at.delay_loading()
-                    success = at.login(username=username, password=password, totp_key=totp_key)
+                    if pending_manual:
+                        # 上一次人工验证超时：这一轮只看结果，不刷新也不重填表单
+                        success = False
+                    else:
+                        if at.initialized:
+                            at.open_portal()
+                            at.delay_loading()
+                        success = at.login(
+                            username=username, password=password, totp_key=totp_key
+                        )
                 else:
                     success = True
+
+                if success:
+                    pending_manual = False
                 if keepalive <= 0:
                     if not success:
                         raise RuntimeError("Login did not complete")
                     return
+
                 time.sleep(keepalive)
-                at.open_portal()
-                at.delay_loading()
+                if pending_manual:
+                    # 人工验证还没做：保持页面不动，隔一段时间响一次铃
+                    at.warn_manual_auth()
+                else:
+                    # 复用当前已登录标签页刷新，绝不再新开窗口
+                    if not at.keepalive_refresh():
+                        at.open_portal()
+                    at.delay_loading()
+            except ManualAuthRequired:
+                # 人工验证未完成：页面保持原状，只响铃提示，不刷新也不重开窗口
+                pending_manual = True
+                if keepalive <= 0:
+                    raise
+                logger.warning(
+                    "Manual authentication still pending; re-checking every {} seconds", keepalive
+                )
+                at.warn_manual_auth()
+                time.sleep(keepalive)
             except (InvalidSessionIdException, NoSuchWindowException):
                 raise
             except Exception as exc:

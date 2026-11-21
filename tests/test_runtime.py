@@ -22,7 +22,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from browser_log import BrowserLog
 from launcher import build_command
-from main import ATrustLogin, ATrustLoginStorage, main
+from main import ATrustLogin, ATrustLoginStorage, ManualAuthRequired, main
 
 
 def login_stub():
@@ -227,6 +227,146 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(address=address):
                 login.driver.current_url = address
                 self.assertEqual(login.is_logged(), expected)
+
+    def test_keepalive_refreshes_current_tab_instead_of_navigating(self):
+        login = login_stub()
+        login.driver.current_url = "https://vpn.example.test/#/app_center"
+        login.driver.window_handles = ["session-tab"]
+        self.assertTrue(login.keepalive_refresh())
+        login.driver.refresh.assert_called_once_with()
+        login.driver.get.assert_not_called()
+        login.driver.switch_to.window.assert_not_called()
+
+    def test_keepalive_returns_to_session_tab_when_portal_opens_a_window(self):
+        login = login_stub()
+        login.driver.current_url = "https://vpn.example.test/#/app_center"
+        login.driver.window_handles = ["session-tab"]
+        login.driver.refresh.side_effect = lambda: setattr(
+            login.driver, "window_handles", ["session-tab", "popup-tab"]
+        )
+        login.focus_session_window = MagicMock(return_value=True)
+        self.assertTrue(login.keepalive_refresh())
+        login.focus_session_window.assert_called_once_with(["session-tab"])
+
+    def test_keepalive_skips_when_current_page_is_not_the_portal(self):
+        login = login_stub()
+        login.driver.current_url = "https://sso.example.test/login"
+        self.assertFalse(login.keepalive_refresh())
+        login.driver.refresh.assert_not_called()
+
+    def test_manual_wait_timeout_raises_without_refreshing(self):
+        login = login_stub()
+        login.login_timeout = 0.05
+        login.beep = False
+        login.interactive = True
+        login.update_storage = MagicMock()
+        with patch("main.WebDriverWait") as wait:
+            wait.return_value.until.side_effect = TimeoutException("still pending")
+            with self.assertRaises(ManualAuthRequired):
+                login.wait_for_manual_login()
+        login.update_storage.assert_not_called()
+        login.driver.refresh.assert_not_called()
+        login.driver.get.assert_not_called()
+
+    def test_manual_alert_is_beeped_once_per_interval(self):
+        login = login_stub()
+        login.manual_beep_interval = 60
+        login._manual_auth_at = None
+        with patch.object(login, "ring_attention", return_value=True) as ring:
+            login.warn_manual_auth()
+            login.warn_manual_auth()
+        self.assertEqual(ring.call_count, 1)
+
+    def test_beep_can_be_disabled(self):
+        login = login_stub()
+        login.beep = False
+        login.beep_tty = None
+        with patch("main.sys.stderr") as stderr:
+            self.assertFalse(login.ring_attention())
+        stderr.write.assert_not_called()
+
+    def test_beep_writes_bel_to_configured_target(self):
+        login = login_stub()
+        login.beep = True
+        with tempfile.NamedTemporaryFile("w+", suffix=".tty") as target:
+            login.beep_tty = target.name
+            self.assertTrue(login.ring_attention())
+            target.seek(0)
+            self.assertEqual(target.read(), "\a")
+
+    def test_beep_falls_back_to_stderr_without_a_terminal(self):
+        login = login_stub()
+        login.beep = True
+        login.beep_tty = None
+        login.manual_beep_interval = 60
+        with patch("builtins.open", side_effect=OSError("no tty")), patch("main.sys.stderr") as stderr:
+            self.assertTrue(login.ring_attention())
+        stderr.write.assert_called_once_with("\a")
+
+    def test_zero_beep_interval_is_rejected(self):
+        with patch("main.webdriver.Chrome"):
+            with self.assertRaises(ValueError):
+                ATrustLogin("https://vpn.example.test", manual_beep_interval=0)
+
+    def test_pending_manual_auth_never_navigates_or_refreshes(self):
+        """人工验证超时后：不重新导航、不刷新、不重填表单，只响铃。"""
+        at = login_stub()
+        at.initialized = True
+        at.is_logged = MagicMock(return_value=False)
+        at.login = MagicMock(side_effect=ManualAuthRequired("pending"))
+        at.open_portal = MagicMock()
+        at.keepalive_refresh = MagicMock(return_value=True)
+        at.warn_manual_auth = MagicMock()
+        at.delay_loading = MagicMock()
+        at.close = MagicMock()
+
+        stops = {"n": 0}
+
+        def fake_sleep(_seconds):
+            stops["n"] += 1
+            if stops["n"] >= 3:
+                raise SystemExit(0)
+
+        with patch("main.ATrustLogin", return_value=at), \
+                patch("main.ATrustLogin.wait_for_port"), \
+                patch("main.time.sleep", side_effect=fake_sleep), \
+                patch("main.logger"):
+            with self.assertRaises(SystemExit):
+                main("https://vpn.example.test", username="u", password="p",
+                     keepalive=60, wait_atrust=False, beep=True)
+
+        # 第一轮登录一次并导航一次；之后既不再导航也不刷新、不重新提交表单
+        self.assertEqual(at.login.call_count, 1)
+        self.assertEqual(at.open_portal.call_count, 1)
+        at.keepalive_refresh.assert_not_called()
+        self.assertGreaterEqual(at.warn_manual_auth.call_count, 2)
+
+    def test_successful_keepalive_reuses_the_same_tab(self):
+        at = login_stub()
+        at.initialized = True
+        at.is_logged = MagicMock(return_value=True)
+        at.keepalive_refresh = MagicMock(return_value=True)
+        at.open_portal = MagicMock()
+        at.delay_loading = MagicMock()
+        at.close = MagicMock()
+
+        ticks = {"n": 0}
+
+        def fake_sleep(_seconds):
+            ticks["n"] += 1
+            if ticks["n"] >= 2:
+                raise SystemExit(0)
+
+        with patch("main.ATrustLogin", return_value=at), \
+                patch("main.ATrustLogin.wait_for_port"), \
+                patch("main.time.sleep", side_effect=fake_sleep), \
+                patch("main.logger"):
+            with self.assertRaises(SystemExit):
+                main("https://vpn.example.test", username="u", password="p",
+                     keepalive=60, wait_atrust=False)
+
+        at.keepalive_refresh.assert_called()
+        at.open_portal.assert_not_called()
 
     def test_corrupt_session_data_allows_browser_login(self):
         login = login_stub()
